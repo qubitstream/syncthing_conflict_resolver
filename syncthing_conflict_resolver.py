@@ -23,7 +23,7 @@
 #
 # Christoph Haunschmidt 2015-11
 
-__version__ = '2015-11-25.0'
+__version__ = '2015-11-25.1'
 
 import os.path
 import argparse
@@ -35,6 +35,7 @@ from collections import defaultdict
 SYNC_CONFLICT_RE = re.compile(r'^(?P<root>.*)\.sync-conflict-\d{8}-\d{6}(?P<extension>\.[^\.]*){0,1}$')
 DELETED_FILES = 0
 RENAMED_FILES = 0
+DELETED_ORPHANED_FILES = 0
 
 
 def check_conflicting_files(original_fn, conflict_file_set):
@@ -58,6 +59,7 @@ def check_conflicting_files(original_fn, conflict_file_set):
         do_delete = True
 
     if not do_delete:
+        logging.debug('Skipping deletion of conflicting files for {}'.format(original_fn))
         return
 
     for to_delete_fn in to_delete_fns:
@@ -65,41 +67,63 @@ def check_conflicting_files(original_fn, conflict_file_set):
             try:
                 os.remove(to_delete_fn)
                 DELETED_FILES += 1
+                logging.debug('Deleted {}'.format(to_delete_fn))
             except Exception as e:
                 logging.error('Error deleting {}: {}'.format(to_delete_fn, e))
         else:
-            logging.info('DRY RUN: would delete {}'.format(to_delete_fn))
+            logging.info('Dry-run: would delete {}'.format(to_delete_fn))
 
     if original_fn != newest_fn:
         if not ARGS.dry_run:
             try:
                 os.rename(newest_fn, original_fn)
                 RENAMED_FILES += 1
+                logging.debug('Renamed {} to {}'.format(newest_fn, original_fn))
             except Exception as e:
                 logging.error('Error renaming {} to {}: {}'.format(newest_fn, original_fn, e))
         else:
-            logging.info('DRY RUN: would rename {} to {}'.format(newest_fn, original_fn))
+            logging.info('Dry-run: would rename {} to {}'.format(newest_fn, original_fn))
 
 
 def check_dir(directory):
     """Checks a directory (and possible subdirs) for sync-conflict files"""
+    global DELETED_ORPHANED_FILES
     conflicting_files = defaultdict(set)
 
     for root, dirs, files in os.walk(directory):
-        try:
-            for fn in files:
+        for fn in files:
+            try:
                 m = SYNC_CONFLICT_RE.match(fn)
                 if m:
                     conflicting_fn = m.group('root') + (m.group('extension') or '')
+                    full_conflicting_fn = os.path.join(root, conflicting_fn)
+                    full_fn = os.path.join(root, fn)
                     if conflicting_fn in files:
-                        conflicting_files[os.path.join(root, conflicting_fn)].add(os.path.join(root, fn))
-                        logging.debug('DIR {}: CONFLICT {} WITH {}'.format(root, conflicting_fn, fn))
+                        conflicting_files[full_conflicting_fn].add(full_fn)
+                        logging.debug('Dir {}: conflict {} with {}'.format(root, conflicting_fn, fn))
                     else:
-                        logging.warning('sync-conflict file without equivalent: {}'.format(
-                            os.path.join(root, fn)
-                        ))
-        except Exception as e:
-            logging.warning(e)
+                        if ARGS.delete_orphans:
+                            if not ARGS.dry_run:
+                                if ARGS.interactive:
+                                    do_delete = input('Y for deleting the orphaned file {}? '.format(
+                                        full_fn)).lower() == 'y'
+                                else:
+                                    do_delete = True
+                                if do_delete:
+                                    try:
+                                        os.remove(full_fn)
+                                        DELETED_ORPHANED_FILES += 1
+                                        logging.debug('Deleted orphaned file {}'.format(full_fn))
+                                    except Exception as e:
+                                        logging.error('Error deleting orphaned file {}: {}'.format(full_fn, e))
+                                else:
+                                    logging.debug('Skipping deletion of orphaned file {}'.format(full_fn))
+                            else:
+                                logging.info('Dry-run: would delete orphaned file {}'.format(full_fn))
+                        else:
+                            logging.info('"Orphaned" sync-conflict file: {}'.format(full_fn))
+            except Exception as e:
+                logging.warning(e)
         if not ARGS.recursive:
             break
 
@@ -117,13 +141,16 @@ if __name__ == '__main__':
         metavar='DIRECTORY', help='directory to check for sync conflicts')
 
     parser.add_argument('-n', '--dry-run', action='store_true',
-        default=False, help='dry run, do not do anything')
+        default=False, help='dry run, do not do anything on the file system')
 
     parser.add_argument('-r', '--recursive', action='store_true',
         default=False, help='recurse into subdirectories')
 
     parser.add_argument('-i', '--interactive', action='store_true',
         default=False, help='prompt for the actions for every sync conflict')
+
+    parser.add_argument('-o', '--delete-orphans', action='store_true',
+        default=False, help='delete "orphaned" *sync-conflict* files')
 
     parser.add_argument('-l', '--log', action='store', default='INFO',
         help='log level. Can be CRITICAL, ERROR, WARNING, INFO, or DEBUG (default: %(default)s)')
@@ -141,6 +168,7 @@ if __name__ == '__main__':
 
     if os.path.isdir(ARGS.directory):
         check_dir(ARGS.directory)
-        print('Done, {} files deleted, {} files renamed.'.format(DELETED_FILES, RENAMED_FILES))
+        print('Done, {} files deleted, {} files renamed, {} orphaned files deleted.'.format(
+            DELETED_FILES, RENAMED_FILES, DELETED_ORPHANED_FILES))
     else:
         logging.critical('{} is not a directory.'.format(ARGS.directory))
